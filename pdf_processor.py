@@ -1,7 +1,9 @@
 import os
 import glob
 import logging
-from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from utils import normalize_text, get_unique_filename
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,7 @@ class PDFSearcher:
         self.total_pdfs = 0
         self.processed_pdfs = 0
         self.total_matches = 0
+        self.lock = threading.Lock()
 
     def get_all_pdfs(self):
         search_path = os.path.join(self.source_dir, "**", "*.pdf")
@@ -36,20 +39,29 @@ class PDFSearcher:
 
             self._report_progress("", 0)
             
-            for pdf_path in pdf_files:
-                if not self.is_running:
-                    break
+            with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) + 4)) as executor:
+                futures = {executor.submit(self._process_single_pdf, pdf_path, os.path.basename(pdf_path)): pdf_path for pdf_path in pdf_files}
                 
-                filename = os.path.basename(pdf_path)
-                self._report_progress(filename, 0)
-                
-                try:
-                    self._process_single_pdf(pdf_path, filename)
-                except Exception as e:
-                    logger.error(f"Erro ao processar {pdf_path}: {e}")
-                
-                self.processed_pdfs += 1
-                self._report_progress(filename, 0)
+                for future in as_completed(futures):
+                    pdf_path = futures[future]
+                    filename = os.path.basename(pdf_path)
+                    
+                    if not self.is_running:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                        
+                    try:
+                        matches_found = future.result()
+                        with self.lock:
+                            self.processed_pdfs += 1
+                            if matches_found > 0:
+                                self.total_matches += matches_found
+                            self._report_progress(filename, 0)
+                    except Exception as e:
+                        logger.error(f"Erro ao processar {pdf_path}: {e}")
+                        with self.lock:
+                            self.processed_pdfs += 1
+                            self._report_progress(filename, 0)
                 
             if self.is_running:
                 self.completion_callback(success=True, message="Busca concluída com sucesso!")
@@ -61,21 +73,23 @@ class PDFSearcher:
             self.completion_callback(success=False, message=f"Erro: {str(e)}")
             
     def _process_single_pdf(self, pdf_path, filename):
+        matches_found = 0
         try:
-            reader = PdfReader(pdf_path)
+            doc = fitz.open(pdf_path)
             
-            if reader.is_encrypted:
+            if doc.needs_pass:
                 logger.warning(f"Ignorando PDF protegido por senha: {pdf_path}")
-                return
+                doc.close()
+                return 0
                 
             found_pages = []
             
-            for page_num in range(len(reader.pages)):
+            for page_num in range(len(doc)):
                 if not self.is_running:
                     break
                     
-                page = reader.pages[page_num]
-                text = page.extract_text()
+                page = doc[page_num]
+                text = page.get_text()
                 
                 if text:
                     normalized_text = normalize_text(text)
@@ -86,26 +100,30 @@ class PDFSearcher:
                 if not self.is_running:
                     break
                     
-                writer = PdfWriter()
-                writer.add_page(reader.pages[page_num])
+                new_doc = fitz.open()
+                new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
                 
                 base_name = os.path.splitext(filename)[0]
                 safe_search_name = "".join(x for x in self.search_name if x.isalnum() or x in " _-")
                 safe_search_name = safe_search_name.strip().replace(" ", "_")
                 
                 new_filename = f"{base_name}_pagina{page_num + 1}_{safe_search_name}.pdf"
-                new_filename = get_unique_filename(self.target_dir, new_filename)
                 
-                output_path = os.path.join(self.target_dir, new_filename)
+                with self.lock:
+                    new_filename = get_unique_filename(self.target_dir, new_filename)
+                    output_path = os.path.join(self.target_dir, new_filename)
                 
-                with open(output_path, "wb") as output_pdf:
-                    writer.write(output_pdf)
+                new_doc.save(output_path)
+                new_doc.close()
                 
-                self.total_matches += 1
-                self._report_progress(filename, 1)
+                matches_found += 1
+                
+            doc.close()
+            return matches_found
                 
         except Exception as e:
             logger.error(f"Erro ao ler/escrever o PDF {pdf_path}: {e}")
+            return 0
 
     def stop_search(self):
         self.is_running = False
