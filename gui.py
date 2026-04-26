@@ -24,8 +24,13 @@ class SearchApp(ctk.CTk):
         self.target_dir = ""
         self.search_thread = None
         self.searcher = None
+        self.last_matches = 0   # inicializado aqui para evitar AttributeError nos callbacks
+        self._closing = False   # flag para impedir callbacks em janela destruída
         
         self._create_widgets()
+        
+        # Intercepta o fechamento da janela para encerrar processos filho
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         
     def _create_widgets(self):
         # Frame principal centralizado
@@ -204,6 +209,17 @@ class SearchApp(ctk.CTk):
         self.search_thread.daemon = True
         self.search_thread.start()
         
+    def _on_close(self):
+        """Encerra todos os processos filho antes de fechar a janela."""
+        self._closing = True  # impede novos callbacks de acessar widgets destruídos
+        if self.searcher and self.searcher.is_running:
+            # Para imediatamente sem pedir confirmação ao fechar
+            self.searcher.stop_search(force=True)
+        # Aguarda a thread de busca terminar (com timeout)
+        if self.search_thread and self.search_thread.is_alive():
+            self.search_thread.join(timeout=2)
+        self.destroy()
+
     def _stop_search(self):
         if self.searcher and self.searcher.is_running:
             confirm = messagebox.askyesno("⏹ Encerrar", "Tem certeza que deseja interromper a busca?\nO progresso atual será mantido.")
@@ -213,7 +229,11 @@ class SearchApp(ctk.CTk):
                 self.btn_stop.configure(state="disabled")
                 
     def _update_progress(self, stats):
+        if self._closing:
+            return  # janela já está sendo destruída, ignora o callback
         def update():
+            if self._closing:
+                return
             self.card_total.configure(text=str(stats['total_pdfs']))
             self.card_processed.configure(text=str(stats['processed_pdfs']))
             self.card_matches.configure(text=str(stats['total_matches']))
@@ -223,7 +243,7 @@ class SearchApp(ctk.CTk):
                 self.last_matches = stats['total_matches']
                 # Temporarily change text color to white then back to green
                 self.card_matches.configure(text_color="#ffffff")
-                self.after(200, lambda: self.card_matches.configure(text_color="#22c55e"))
+                self.after(200, lambda: self.card_matches.configure(text_color="#22c55e") if not self._closing else None)
             
             filename = stats['current_file']
             self.lbl_current_file.configure(text=f"Processando: {self._truncate_path(filename, 50)}")
@@ -232,7 +252,11 @@ class SearchApp(ctk.CTk):
         self.after(0, update)
         
     def _on_search_complete(self, success, message):
+        if self._closing:
+            return  # janela já está sendo destruída, ignora o callback
         def update():
+            if self._closing:
+                return
             self.btn_start.configure(state="normal", fg_color="#16a34a")
             self.btn_source.configure(state="normal")
             self.btn_target.configure(state="normal")
