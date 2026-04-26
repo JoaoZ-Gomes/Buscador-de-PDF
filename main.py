@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+import multiprocessing
 
 # Configuração de Log
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app_errors.log')
@@ -16,6 +17,7 @@ logging.basicConfig(
 from gui import SearchApp
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     try:
         app = SearchApp()
         app.mainloop()
